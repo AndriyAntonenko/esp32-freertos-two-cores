@@ -7,14 +7,17 @@
 #include <esp_timer.h>
 #include <cstdio>
 #include <cstring>
+#include <cinttypes>
 #include <atomic>
 #include <algorithm>
 #include <sx127x.h>
+#include <ssd1306.h>
 #include <packet.h>
 
 const BaseType_t BUTTON_TASK_CORE = 0;
 const BaseType_t LED_TASK_CORE = 0;
 const BaseType_t LORA_TASK_CORE = 1;
+const BaseType_t UI_TASK_CORE = 1;
 
 static const char *TAG = "LORA_LED";
 const int LED_INTERVAL_MS = 100;
@@ -24,10 +27,14 @@ static std::atomic<int> dropped_button_events{0};
 
 static QueueHandle_t button_event_queue = nullptr;
 static QueueHandle_t radio_msg_queue = nullptr;
+static QueueHandle_t ui_event_queue = nullptr;
 
 static TaskHandle_t h_button = nullptr;
 static TaskHandle_t h_led = nullptr;
 static TaskHandle_t h_radio = nullptr;
+static TaskHandle_t h_ui = nullptr;
+
+static Ssd1306 oled;
 
 uint32_t state_message_no = 0;
 
@@ -35,6 +42,24 @@ struct button_event_t
 {
   int64_t timestamp_us;
   int level;
+};
+
+enum class UiKind : uint8_t
+{
+  LED_STATS,
+  RADIO_RESULT
+};
+
+// Two producers merge into one screen: the led task reports timing,
+// the radio task reports the last packet.
+struct ui_event_t
+{
+  UiKind kind;
+  int64_t led_max_late_us;
+  int64_t msg_latency_ms;
+  uint32_t msg_no;
+  packet::click_t msg_event;
+  bool msg_ok;
 };
 
 int us_to_ticks(int us)
@@ -120,6 +145,65 @@ void button_task(void *arg)
   }
 }
 
+void ui_task(void *arg)
+{
+  if (oled.begin(oled_pins::SDA_PIN, oled_pins::SCL_PIN, oled_pins::I2C_ADDR) != ESP_OK)
+  {
+    ESP_LOGE(TAG, "OLED init failed, UI task stopped");
+    vTaskDelete(nullptr);
+  }
+
+  int64_t led_max_late_us = 0;
+  int64_t msg_latency_ms = -1;
+  uint32_t msg_no = 0;
+  packet::click_t msg_event = packet::click_t::SINGLE;
+  bool msg_ok = false;
+  char line[24];
+  ui_event_t ev;
+
+  for (;;)
+  {
+    oled.clear(false);
+    oled.text(0, 0, "LORA + LED", 1);
+
+    snprintf(line, sizeof(line), "blink late %lldus", led_max_late_us);
+    oled.text(0, 12, line, 1);
+
+    if (msg_latency_ms < 0)
+      snprintf(line, sizeof(line), "----");
+    else
+      snprintf(line, sizeof(line), "%lldms", msg_latency_ms);
+    oled.text(0, 26, line, 2);
+
+    if (msg_latency_ms >= 0)
+    {
+      snprintf(line, sizeof(line), "#%" PRIu32 " %s", msg_no,
+               msg_event == packet::click_t::DOUBLE ? "DOUBLE" : "SINGLE");
+      oled.text(0, 46, line, 1);
+
+      snprintf(line, sizeof(line), "%uB %s", (unsigned)packet::SIZE, msg_ok ? "OK" : "FAIL");
+      oled.text(0, 56, line, 1);
+    }
+
+    oled.flush();
+
+    if (xQueueReceive(ui_event_queue, &ev, portMAX_DELAY) != pdTRUE)
+      continue;
+
+    if (ev.kind == UiKind::LED_STATS)
+    {
+      led_max_late_us = ev.led_max_late_us;
+    }
+    else
+    {
+      msg_latency_ms = ev.msg_latency_ms;
+      msg_no = ev.msg_no;
+      msg_event = ev.msg_event;
+      msg_ok = ev.msg_ok;
+    }
+  }
+}
+
 void led_blinking_task(void *arg)
 {
   TickType_t last_wake_time = xTaskGetTickCount();
@@ -139,7 +223,12 @@ void led_blinking_task(void *arg)
 
     if (toggles_count % 50 == 0)
     {
-      ESP_LOGI(TAG, "LED max late %dus", max_late_us);
+      ESP_LOGI(TAG, "LED max late %lldus", max_late_us);
+
+      ui_event_t ev{};
+      ev.kind = UiKind::LED_STATS;
+      ev.led_max_late_us = max_late_us;
+      xQueueSend(ui_event_queue, &ev, 0);
     }
 
     uint8_t new_level = prev_level == 0 ? 1 : 0;
@@ -187,6 +276,14 @@ void radio_task(void *arg)
     ESP_LOGI(TAG, "send #%" PRIu32 " (%s): %s, %lld ms after press",
              act.no, act.event == packet::click_t::DOUBLE ? "double" : "single",
              esp_err_to_name(err), latency_ms);
+
+    ui_event_t ev{};
+    ev.kind = UiKind::RADIO_RESULT;
+    ev.msg_latency_ms = latency_ms;
+    ev.msg_no = act.no;
+    ev.msg_event = act.event;
+    ev.msg_ok = (err == ESP_OK);
+    xQueueSend(ui_event_queue, &ev, 0);
   }
 }
 
@@ -222,10 +319,17 @@ void lora_led_main()
     return;
   }
 
-  radio_msg_queue = xQueueCreate(10, sizeof(packet::Msg));
+  radio_msg_queue = xQueueCreate(10, sizeof(packet::Action));
   if (radio_msg_queue == nullptr)
   {
     ESP_LOGE(TAG, "Failed to create radio event queue");
+    return;
+  }
+
+  ui_event_queue = xQueueCreate(4, sizeof(ui_event_t));
+  if (ui_event_queue == nullptr)
+  {
+    ESP_LOGE(TAG, "Failed to create ui event queue");
     return;
   }
 
@@ -255,6 +359,13 @@ void lora_led_main()
   if (result != pdPASS)
   {
     ESP_LOGE(TAG, "Failed to create led task");
+    return;
+  }
+
+  result = xTaskCreatePinnedToCore(ui_task, "ui_task", 4096, nullptr, 3, &h_ui, UI_TASK_CORE);
+  if (result != pdPASS)
+  {
+    ESP_LOGE(TAG, "Failed to create ui task");
     return;
   }
 }
