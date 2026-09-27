@@ -48,7 +48,7 @@ public:
 
   struct Config
   {
-    uint32_t freq_hz = 433'000'000;
+    uint32_t freq_hz = 868'000'000;
     Sf sf = Sf::SF7;
     Bw bw = Bw::BW_125K;
     Cr cr = Cr::CR_4_5;

@@ -78,7 +78,7 @@ LED blinks at a fixed 100 ms while the radio sends 32-byte LoRa packets. A butto
 queues a packet. The point is that a transmission lasting about one second does not disturb
 the 100 ms blink.
 
-Radio configuration: 433 MHz, SF11, BW 125 kHz, CR 4/5, explicit header, CRC on,
+Radio configuration: 868 MHz, SF11, BW 125 kHz, CR 4/5, explicit header, CRC on,
 preamble 8, sync word 0x12. Low Data Rate Optimize is derived from SF and BW, not passed in,
 so it can never disagree with the registers.
 
