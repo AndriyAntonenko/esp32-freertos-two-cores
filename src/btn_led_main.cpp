@@ -7,11 +7,14 @@
 #include <esp_timer.h>
 #include <cstdio>
 #include <cstring>
+#include <cinttypes>
 #include <atomic>
 #include <algorithm>
+#include <ssd1306.h>
 
 const BaseType_t BUTTON_TASK_CORE = 0;
 const BaseType_t LED_TASK_CORE = 1;
+const BaseType_t UI_TASK_CORE = 0;
 
 static const char *TAG = "FREE_RTOS_TASK";
 const int MAX_LED_INTERVAL_MS = 2000;
@@ -23,8 +26,12 @@ static std::atomic<int> dropped_button_events{0};
 
 static QueueHandle_t button_event_queue = nullptr;
 static QueueHandle_t led_event_queue = nullptr;
+static QueueHandle_t ui_state_queue = nullptr;
 static TaskHandle_t h_button = nullptr;
 static TaskHandle_t h_led = nullptr;
+static TaskHandle_t h_ui = nullptr;
+
+static Ssd1306 oled;
 
 struct button_event_t
 {
@@ -41,6 +48,13 @@ enum class LedIntervalDirection : uint8_t
 struct led_event_t
 {
   LedIntervalDirection interval_direction;
+};
+
+struct ui_state_t
+{
+  int interval_ms;
+  LedIntervalDirection last_direction;
+  uint32_t press_count;
 };
 
 int us_to_ticks(int us)
@@ -120,10 +134,43 @@ void button_task(void *arg)
   }
 }
 
+void ui_task(void *arg)
+{
+  if (oled.begin(oled_pins::SDA_PIN, oled_pins::SCL_PIN, oled_pins::I2C_ADDR) != ESP_OK)
+  {
+    ESP_LOGE(TAG, "OLED init failed, UI task stopped");
+    vTaskDelete(nullptr);
+  }
+
+  ui_state_t st{MIN_LED_INTERVAL_MS, LedIntervalDirection::FORWARD, 0};
+  char line[24];
+
+  for (;;)
+  {
+    oled.clear(false);
+    oled.text(0, 0, "BTN + LED", 1);
+
+    snprintf(line, sizeof(line), "%dms", st.interval_ms);
+    oled.text(0, 14, line, 3);
+
+    snprintf(line, sizeof(line), "click: %s",
+             st.last_direction == LedIntervalDirection::BACK ? "DOUBLE" : "SINGLE");
+    oled.text(0, 44, line, 1);
+
+    snprintf(line, sizeof(line), "count: %" PRIu32, st.press_count);
+    oled.text(0, 54, line, 1);
+
+    oled.flush();
+
+    xQueueReceive(ui_state_queue, &st, portMAX_DELAY);
+  }
+}
+
 void led_blinking_task(void *arg)
 {
   led_event_t event;
   uint8_t prev_level = 0;
+  uint32_t press_count = 0;
   int blink_interval_ms = MIN_LED_INTERVAL_MS;
 
   for (;;)
@@ -144,6 +191,9 @@ void led_blinking_task(void *arg)
       ESP_LOGI(TAG, "New blink interval is %d ms", blink_interval_ms);
       prev_level = 0;
       gpio_set_level(app_board_pins::LED_PIN, prev_level);
+
+      ui_state_t st{blink_interval_ms, event.interval_direction, ++press_count};
+      xQueueOverwrite(ui_state_queue, &st);
     }
     else
     {
@@ -194,6 +244,14 @@ void btn_led_main()
     return;
   }
 
+  // length 1, required by xQueueOverwrite
+  ui_state_queue = xQueueCreate(1, sizeof(ui_state_t));
+  if (ui_state_queue == nullptr)
+  {
+    ESP_LOGE(TAG, "Failed to create ui state queue");
+    return;
+  }
+
   BaseType_t result = xTaskCreatePinnedToCore(button_task, "button_task", 1024, nullptr, 10, &h_button, BUTTON_TASK_CORE);
   if (result != pdPASS)
   {
@@ -213,6 +271,13 @@ void btn_led_main()
   if (result != pdPASS)
   {
     ESP_LOGE(TAG, "Failed to create led task");
+    return;
+  }
+
+  result = xTaskCreatePinnedToCore(ui_task, "ui_task", 4096, nullptr, 3, &h_ui, UI_TASK_CORE);
+  if (result != pdPASS)
+  {
+    ESP_LOGE(TAG, "Failed to create ui task");
     return;
   }
 }
